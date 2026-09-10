@@ -1,0 +1,19 @@
+vision_model: openai/clip-vit-large-patch14
+
+qwen_model: Qwen/Qwen3.8-27B
+
+num_visual_tokens: 32
+
+max_text_length: 256
+
+batch_size: 4
+
+learning_rate: 0.0001
+
+weight_decay: 0.01
+
+num_epochs: 3
+
+gradient_accumulation_steps: 4
+
+save_dir: ./checkpoints
