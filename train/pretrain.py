@@ -15,13 +15,28 @@ from data.sa1b_dataset import PretrainedDataset
 from data.collator import MultiModalCollator
 from modelscope import snapshot_download
 from datasets import load_dataset as hf_load_dataset
+import argparse
+import os
 
 # 调试用小模型；确认能跑通后再换更大的
 VISION_MODEL = "AI-ModelScope/clip-vit-large-patch14"
 QWEN_MODEL = "Qwen/Qwen2.5-0.5B"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # None = 跑完整 epoch（10 万条样本）；调试通路时可临时设成 10
-max_steps = 10
+max_steps = None
+
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--epochs", type=int, default=1)
+    p.add_argument("--batch_size", type=int, default=16)
+    p.add_argument("--max_steps", type=int, default=None, help="None=跑全量, 设10=通路测试")
+    p.add_argument("--num_samples", type=int, default=100000)
+    p.add_argument("--save_dir", type=str, default="./checkpoints")
+    p.add_argument("--save_every", type=int, default=500)
+    p.add_argument("--num_workers", type=int, default=4)
+    return p.parse_args()
+args=parse_args()
+NUM_SAMPLES = args.num_samples 
 
 # vision_dir=snapshot_download(VISION_MODEL)
 qwen_dir=snapshot_download(QWEN_MODEL)
@@ -30,24 +45,6 @@ tokenizer = AutoTokenizer.from_pretrained(qwen_dir, trust_remote_code=True)
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
 
-# #region agent log
-import json as _json, time as _time
-_log_path = ROOT / "debug-429253.log"
-with open(_log_path, "a", encoding="utf-8") as _f:
-    _f.write(_json.dumps({
-        "sessionId": "429253",
-        "runId": "post-fix",
-        "hypothesisId": "B",
-        "location": "pretrain.py:before VisionEncoder",
-        "message": "passing VISION_MODEL into VisionEncoder",
-        "data": {
-            "VISION_MODEL": VISION_MODEL,
-            "vision_dir_line_commented": True,
-            "qwen_dir": str(qwen_dir),
-        },
-        "timestamp": int(_time.time() * 1000),
-    }, ensure_ascii=False) + "\n")
-# #endregion
 vision_encoder = VisionEncoder(VISION_MODEL)
 qwen = AutoModelForCausalLM.from_pretrained(
     qwen_dir,
@@ -79,7 +76,7 @@ from modelscope.hub.snapshot_download import dataset_snapshot_download
 import math
 import pyarrow.parquet as pq
 
-NUM_SAMPLES = 100_000   # 目标训练样本数：想改规模只动这一个数
+  # 目标训练样本数：想改规模只动这一个数
 shard_dir = ROOT / "data_cache" / "sa1b_shards"
 
 dataset_snapshot_download(
@@ -104,18 +101,7 @@ parquet_files = sorted(str(p) for p in shard_dir.rglob("*.parquet"))
 if not parquet_files:
     raise FileNotFoundError(f"No parquet under {shard_dir}; shard download failed")
 data=hf_load_dataset("parquet",data_files=parquet_files,split="train")
-# #region agent log
-with open(_log_path, "a", encoding="utf-8") as _f:
-    _f.write(_json.dumps({
-        "sessionId": "429253",
-        "runId": "post-fix",
-        "hypothesisId": "G",
-        "location": "pretrain.py:after shard download",
-        "message": "parquet shards on disk",
-        "data": {"n_files": len(parquet_files), "files": parquet_files[:5]},
-        "timestamp": int(_time.time() * 1000),
-    }, ensure_ascii=False) + "\n")
-# #endregion
+
 if not  parquet_files:
     raise FileNotFoundError(f"No parquet under {shard_dir}; shard download failed")
 
@@ -126,31 +112,23 @@ print(f"Total rows available in downloaded shards: {len(data)}")
 if len(data) > NUM_SAMPLES:
     data = data.shuffle(seed=42).select(range(NUM_SAMPLES))
 print(f"Training samples after selection: {len(data)}")
-# #region agent log
-with open(_log_path, "a", encoding="utf-8") as _f:
-    _f.write(_json.dumps({
-        "sessionId": "429253",
-        "runId": "post-fix",
-        "hypothesisId": "G",
-        "location": "pretrain.py:after hf_load_dataset",
-        "message": "smoke dataset loaded",
-        "data": {"len": len(data), "sample_keys": list(data[0].keys())},
-        "timestamp": int(_time.time() * 1000),
-    }, ensure_ascii=False) + "\n")
-# #endregion
+
 dataset = PretrainedDataset(
     data=data,
     processor=model.vision_encoder.processor,
     tokenizer=tokenizer,
 )
+
+os.makedirs(args.save_dir, exist_ok=True)
 dataloader = DataLoader(
     dataset,
-    # batch_size=8,
-    batch_size=2,
+    batch_size=args.batch_size,
     shuffle=True,
     collate_fn=MultiModalCollator(),
+    num_workers=args.num_workers,
+    pin_memory=True,
+    persistent_workers=True if args.num_workers > 0 else False,
 )
-
 model.train()
 for epoch in range(1):
     for step, batch in enumerate(dataloader):
@@ -171,7 +149,16 @@ for epoch in range(1):
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
-        if step % 50 == 0:
-            print(f"Epoch:{epoch} Step:{step}/{len(dataloader)} Loss:{loss.item():.4f}")
 
-print("pretrain smoke test finished OK")
+        if step % 50 == 0:
+            print(f"Epoch:{epoch} Step:{step}/{len(dataloader)} Loss:{loss.item():.4f}", flush=True)
+
+        if step % args.save_every == 0 and step > 0:
+            ckpt = os.path.join(args.save_dir, f"projector-epoch{epoch}-step{step}.pt")
+            torch.save(model.projector.state_dict(), ckpt)
+            print(f"saved {ckpt}", flush=True)
+        if step % 50 == 0:
+            print(f"Epoch:{epoch} Step:{step}/{len(dataloader)} Loss:{loss.item():.4f}", flush=True)
+
+torch.save(model.projector.state_dict(), os.path.join(args.save_dir, "projector-final.pt"))
+print("pretrain finished OK")

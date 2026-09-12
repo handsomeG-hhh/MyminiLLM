@@ -1,6 +1,6 @@
 vision_model: openai/clip-vit-large-patch14
 
-qwen_model: Qwen/Qwen3.8-27B
+qwen_model: Qwen/Qwen2.5-0.5B
 
 num_visual_tokens: 32
 
